@@ -344,6 +344,133 @@ def strip(hist, name, n=14):
     return f'<span class="strip" aria-label="Last {len(vals)} readings">{dots}</span>'
 
 
+REFRESH_CSS = """
+.actions { display:flex; flex-wrap:wrap; align-items:center; gap:12px; margin-top:14px; }
+.btn { font:inherit; font-weight:600; font-size:.95rem; color:var(--ink); background:transparent;
+  border:2px solid var(--ink); border-radius:99px; padding:7px 18px; cursor:pointer; }
+.btn:hover:not(:disabled) { background:var(--ink); color:var(--paper); }
+.btn:disabled { opacity:.5; cursor:progress; }
+.btn:focus-visible, .link:focus-visible, dialog input:focus-visible { outline:3px solid var(--a); outline-offset:2px; }
+#refresh-msg { color:var(--muted); font-size:.9rem; }
+.link { font:inherit; background:none; border:0; padding:0; color:var(--muted); text-decoration:underline; cursor:pointer; }
+dialog { background:var(--paper); color:var(--ink); border:1px solid var(--rule); border-radius:14px;
+  padding:22px 24px; max-width:min(460px, calc(100vw - 32px)); }
+dialog::backdrop { background:rgba(10,18,26,.55); }
+dialog h2 { font-size:1.25rem; margin-bottom:8px; }
+dialog ol { padding-left:20px; margin:8px 0 14px; }
+dialog p { margin:0 0 10px; }
+dialog input { width:100%; font:inherit; padding:9px 12px; border:1px solid var(--rule); border-radius:8px;
+  background:var(--bg); color:var(--ink); }
+.dlg-actions { display:flex; gap:10px; justify-content:flex-end; margin-top:14px; }
+"""
+
+REFRESH_HTML = """
+<div class="actions">
+  <button class="btn" id="refresh" type="button">Refresh now</button>
+  <span id="refresh-msg" role="status" aria-live="polite"></span>
+</div>
+<dialog id="token-dlg" aria-labelledby="dlg-title">
+  <form method="dialog">
+    <h2 id="dlg-title">Connect this page to GitHub</h2>
+    <p>The refresh button needs a GitHub access token. It is saved only in this browser, never in the page.</p>
+    <ol>
+      <li>On GitHub go to Settings, Developer settings, Personal access tokens, Fine-grained tokens, Generate new token.</li>
+      <li>Repository access: only <strong>__REPO__</strong>.</li>
+      <li>Permissions: <strong>Actions</strong> set to Read and write.</li>
+    </ol>
+    <label for="token-input">Paste the token</label>
+    <input id="token-input" type="password" autocomplete="off" spellcheck="false">
+    <div class="dlg-actions">
+      <button class="link" id="token-cancel" type="button">Cancel</button>
+      <button class="btn" id="token-save" type="submit">Save and refresh</button>
+    </div>
+  </form>
+</dialog>
+"""
+
+REFRESH_JS = """
+<script>
+(function () {
+  var REPO = "__REPO__", WF = "__WF__";
+  var btn = document.getElementById("refresh"), msg = document.getElementById("refresh-msg");
+  var dlg = document.getElementById("token-dlg"), input = document.getElementById("token-input");
+  var KEY = "ms_gh_token";
+  var store = {
+    get: function () { try { return localStorage.getItem(KEY); } catch (e) { return null; } },
+    set: function (v) { try { localStorage.setItem(KEY, v); } catch (e) {} },
+    clear: function () { try { localStorage.removeItem(KEY); } catch (e) {} }
+  };
+  function say(t) { msg.textContent = t; }
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+  function api(path, opts) {
+    opts = opts || {};
+    var h = { "Accept": "application/vnd.github+json", "Authorization": "Bearer " + store.get(),
+              "X-GitHub-Api-Version": "2022-11-28" };
+    if (opts.body) h["Content-Type"] = "application/json";
+    return fetch("https://api.github.com/repos/" + REPO + path,
+                 { method: opts.method || "GET", headers: h, body: opts.body });
+  }
+  async function run() {
+    if (!store.get()) { dlg.showModal(); input.focus(); return; }
+    btn.disabled = true;
+    var since = new Date(Date.now() - 10000).toISOString();
+    say("Starting the update.");
+    try {
+      var r = await api("/actions/workflows/" + WF + "/dispatches",
+                        { method: "POST", body: JSON.stringify({ ref: "main" }) });
+      if (r.status === 401 || r.status === 403 || r.status === 404) {
+        store.clear(); btn.disabled = false;
+        say("GitHub rejected the token. Click Refresh now to add a new one."); return;
+      }
+      if (!r.ok) { btn.disabled = false; say("The update did not start (GitHub error " + r.status + ")."); return; }
+      say("Update running. This usually takes about two minutes.");
+      for (var i = 0; i < 40; i++) {
+        await sleep(8000);
+        var q = await api("/actions/workflows/" + WF + "/runs?event=workflow_dispatch&per_page=1&created=" +
+                          encodeURIComponent(">=" + since));
+        if (!q.ok) continue;
+        var latest = (await q.json()).workflow_runs[0];
+        if (!latest || latest.status !== "completed") continue;
+        if (latest.conclusion === "success") {
+          say("Updated. Loading the new readings.");
+          await sleep(15000);
+          location.href = location.pathname + "?t=" + Date.now();
+        } else {
+          btn.disabled = false;
+          say("The update failed. Open the Actions tab on GitHub to see why.");
+        }
+        return;
+      }
+      btn.disabled = false; say("Still running. Reload the page in a minute or two.");
+    } catch (e) {
+      btn.disabled = false; say("Could not reach GitHub. Check your connection and try again.");
+    }
+  }
+  btn.addEventListener("click", run);
+  document.getElementById("token-save").addEventListener("click", function (e) {
+    e.preventDefault();
+    var v = input.value.trim();
+    if (!v) { input.focus(); return; }
+    store.set(v); input.value = ""; dlg.close(); run();
+  });
+  document.getElementById("token-cancel").addEventListener("click", function () { dlg.close(); });
+  var forget = document.getElementById("token-forget");
+  if (forget) forget.addEventListener("click", function () { store.clear(); say("Token removed from this browser."); });
+})();
+</script>
+"""
+
+
+def refresh_parts():
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    wf = os.environ.get("WORKFLOW_FILE", "crash-monitor.yml")
+    if not repo:
+        return "", "", ""
+    fill = lambda t: t.replace("__REPO__", html.escape(repo)).replace("__WF__", wf)
+    forget = ' <button class="link" id="token-forget" type="button">Remove saved GitHub token</button>'
+    return fill(REFRESH_HTML), fill(REFRESH_JS), forget
+
+
 def build_page(results, alerts, score, overall, hist):
     updated = dt.datetime.now(dt.timezone.utc).strftime("%a %d %b %Y, %H:%M UTC")
     rows = []
@@ -359,6 +486,7 @@ def build_page(results, alerts, score, overall, hist):
         items = "".join(f"<li>{html.escape(a)}</li>" for a in alerts)
         alert_html = f'<section class="alerts" aria-label="Cluster alerts"><h2>Cluster alerts</h2><ul>{items}</ul></section>'
     counts = {lv: sum(1 for r in results if r.level == lv) for lv in (RED, AMBER, GREEN)}
+    refresh_html, refresh_js, forget_html = refresh_parts()
     return f'''<!doctype html>
 <html lang="en">
 <head>
@@ -426,6 +554,7 @@ section.block > h2 {{ font-size:1.35rem; margin-bottom:12px; }}
 .axis {{ fill:var(--muted); font-size:11px; }} .axis.end {{ text-anchor:end; }}
 .empty {{ color:var(--muted); margin:8px; }}
 footer {{ margin-top:36px; color:var(--muted); font-size:.85rem; }}
+{REFRESH_CSS}
 @media (max-width:620px) {{
   .hero {{ grid-template-columns:1fr; padding:20px; }}
   .gauge {{ max-width:260px; justify-self:center; }}
@@ -440,6 +569,7 @@ footer {{ margin-top:36px; color:var(--muted); font-size:.85rem; }}
       <div class="score">{score}<small> / 20</small></div>
       <h1 class="{CLS[overall]}">{HEADLINE[overall]}</h1>
       <p class="meta">{counts[RED]} red, {counts[AMBER]} amber, {counts[GREEN]} green. Updated {updated}.</p>
+      {refresh_html}
     </div>
   </section>
   {alert_html}
@@ -455,9 +585,10 @@ footer {{ margin-top:36px; color:var(--muted); font-size:.85rem; }}
   </section>
   <footer>
     Sources: FRED, US Treasury Fiscal Data, Yahoo Finance. FRED series reflect the previous close.
-    Dots under each indicator show its last 14 readings, oldest on the left. Not investment advice.
+    Dots under each indicator show its last 14 readings, oldest on the left. Not investment advice.{forget_html}
   </footer>
 </main>
+{refresh_js}
 </body>
 </html>'''
 
